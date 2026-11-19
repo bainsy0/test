@@ -421,6 +421,26 @@ namespace SuperAgentToggle
             return r.Output.IndexOf("yes", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
+        // A plain service restart: the unit is restarted in place, the tmux session and the
+        // keep-alive helper stay up, and the manually-stopped marker is cleared so the
+        // supervisor does not refuse to come back.
+        internal static bool RestartService()
+        {
+            if (!DistroRunning()) return false;
+            // RefuseManualStop=yes also rejects manual restart, so step aside first and re-arm
+            // only after the unit is healthy again (the caller does that).
+            SetGuard(false);
+            Run("rm -f " + Program.Marker + "; systemctl daemon-reload; " +
+                "systemctl reset-failed " + Program.Unit + " 2>/dev/null; " +
+                "systemctl restart " + Program.Unit, 90000);
+            for (int i = 0; i < 40; i++)
+            {
+                Thread.Sleep(i < 20 ? 500 : 1500);
+                if (GetState(true) == AgentState.Running) return true;
+            }
+            return false;
+        }
+
         // Stops the service, ends our keep-alive helper and kills any leftover process.
         // WSL is only shut down when we started it and nobody else is using it.
         internal static void StopAll()
@@ -502,6 +522,7 @@ namespace SuperAgentToggle
         private readonly Label _detail = new Label();
         private readonly Button _btnToggle = new Button();
         private readonly Button _btnWeb = new Button();
+        private readonly Button _btnRestart = new Button();
         private readonly TextBox _log = new TextBox();
         private readonly System.Windows.Forms.Timer _timer = new System.Windows.Forms.Timer();
         private NotifyIcon _tray;
@@ -567,7 +588,7 @@ namespace SuperAgentToggle
             // window is measured in real pixels, so the whole layout is scaled by the real
             // factor ourselves — letting WinForms auto-scale fights with explicit SetBounds.
             AutoScaleMode = AutoScaleMode.None;
-            ClientSize = new Size(Dpi.S(464), Dpi.S(372));
+            ClientSize = new Size(Dpi.S(464), Dpi.S(428));
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
@@ -596,7 +617,13 @@ namespace SuperAgentToggle
             _btnWeb.Click += async (s, e) => await OpenWebAsync();
             Controls.Add(_btnWeb);
 
-            _log.SetBounds(Dpi.S(18), Dpi.S(160), Dpi.S(428), Dpi.S(192));
+            _btnRestart.SetBounds(Dpi.S(18), Dpi.S(156), Dpi.S(428), Dpi.S(44));
+            _btnRestart.Font = Dpi.UiFont(10f, FontStyle.Bold);
+            _btnRestart.Text = "重启 SuperAgent";
+            _btnRestart.Click += async (s, e) => await RestartAgentAsync();
+            Controls.Add(_btnRestart);
+
+            _log.SetBounds(Dpi.S(18), Dpi.S(212), Dpi.S(428), Dpi.S(200));
             _log.Multiline = true;
             _log.ReadOnly = true;
             _log.ScrollBars = ScrollBars.Vertical;
@@ -607,6 +634,7 @@ namespace SuperAgentToggle
             var tip = new ToolTip();
             tip.SetToolTip(_btnToggle, "启动或停止 WSL 里的 SuperAgent 服务");
             tip.SetToolTip(_btnWeb, "在浏览器打开 SuperAgent 网页");
+            tip.SetToolTip(_btnRestart, "重启 WSL 里的 SuperAgent 服务（不清除 tmux 会话与保活）");
 
             BuildTray();
 
@@ -671,6 +699,7 @@ namespace SuperAgentToggle
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("启动 SuperAgent", null, async (s, e) => await StartAgentAsync());
             menu.Items.Add("停止 SuperAgent", null, async (s, e) => await StopAgentAsync());
+            menu.Items.Add("重启 SuperAgent", null, async (s, e) => await RestartAgentAsync());
             menu.Items.Add("打开网页", null, async (s, e) => await OpenWebAsync());
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("退出", null, (s, e) => ExitApp());
@@ -858,6 +887,7 @@ namespace SuperAgentToggle
             _detail.Text = "分发版 " + Program.Distro + "   服务 " + Program.Unit +
                            "   保活会话：" + (holder ? "有" : "无");
             _btnToggle.Enabled = !_busy;
+            _btnRestart.Enabled = !_busy && (state == AgentState.Running || state == AgentState.Broken);
             _tray.Text = ("SuperAgent 开关 - " + _status.Text.Replace("● ", "").Replace("○ ", "")).Substring(0,
                 Math.Min(63, ("SuperAgent 开关 - " + _status.Text.Replace("● ", "").Replace("○ ", "")).Length));
         }
@@ -867,6 +897,7 @@ namespace SuperAgentToggle
             _busy = busy;
             _btnToggle.Enabled = !busy;
             _btnWeb.Enabled = !busy;
+            _btnRestart.Enabled = !busy;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
         }
 
@@ -1005,6 +1036,42 @@ namespace SuperAgentToggle
             WriteStopSummary(after);
             if (after == AgentState.Running || after == AgentState.Broken)
                 WriteError("服务未能完全停止，请重试");
+            await RefreshUiAsync();
+        }
+
+        // Restart keeps the toggle's intent: SuperAgent must be up afterwards, so the guard
+        // is re-armed and _desiredRunning stays true even when the restart fails.
+        private async Task RestartAgentAsync()
+        {
+            if (_busy) return;
+            SetBusy(true);
+            _desiredRunning = true;
+            WriteLog("正在重启 SuperAgent...");
+            var ok = false;
+            try
+            {
+                ok = await Task.Run(() =>
+                {
+                    // A restart on a stopped agent is really a start: no WSL, no holder.
+                    if (!Wsl.DistroRunning()) Wsl.MarkOwned(true);
+                    if (!Wsl.HolderAlive()) Wsl.StartHolder();
+                    return Wsl.RestartService();
+                });
+            }
+            catch (Exception ex) { WriteError("重启失败: " + ex.Message); }
+
+            if (ok)
+            {
+                try { await Task.Run(() => Wsl.SetGuard(true)); } catch { }
+                WriteLog("SuperAgent 已重启");
+                if (!Visible) _tray.ShowBalloonTip(3000, "SuperAgent 已重启", "服务已重新就绪。", ToolTipIcon.Info);
+            }
+            else
+            {
+                // The watchdog retries from here; do not re-arm the guard on a broken unit.
+                WriteError("重启未成功，守护会继续重试；也可查看日志 " + Program.LogDir + "/supervisor.log");
+            }
+            SetBusy(false);
             await RefreshUiAsync();
         }
 
